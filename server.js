@@ -32,9 +32,56 @@ async function getTileJson(country) {
   catch (error) { tileJsonCache.delete(country); throw error; }
 }
 
+async function geocode(query) {
+  const url = new URL("https://photon.komoot.io/api/");
+  url.searchParams.set("q", query);
+  url.searchParams.set("limit", "6");
+  url.searchParams.set("lang", "en");
+  const response = await fetch(url.toString(), { headers: { Accept: "application/geo+json, application/json" } });
+  if (!response.ok) throw new Error("Place search is temporarily unavailable");
+  const data = await response.json();
+  const seen = new Set();
+  const places = [];
+  for (const feature of data.features || []) {
+    const coordinates = feature.geometry && feature.geometry.coordinates;
+    const properties = feature.properties || {};
+    if (!Array.isArray(coordinates) || coordinates.length < 2) continue;
+    const lng = Number(coordinates[0]), lat = Number(coordinates[1]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) continue;
+    const street = [properties.housenumber, properties.street].filter(Boolean).join(" ");
+    const primary = street || properties.name || properties.city || "Place";
+    const parts = [primary, properties.city, properties.state, properties.country].filter(Boolean);
+    const label = parts.filter((part, index) => parts.indexOf(part) === index).join(", ");
+    const key = lat.toFixed(5) + "," + lng.toFixed(5);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    places.push({ label, lat, lng, detail: [properties.type, properties.osm_value].filter(Boolean).join(" · ") });
+    if (places.length === 5) break;
+  }
+  return places;
+}
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
+
+    if (url.pathname === "/api/geocode") {
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      let body;
+      try { body = await request.json(); }
+      catch { return Response.json({ error: "Send a JSON place query." }, { status: 400 }); }
+      const query = typeof body.query === "string" ? body.query.trim() : "";
+      if (!query || query.length > 180 || /[\u0000-\u001f]/.test(query)) {
+        return Response.json({ error: "Enter a place or address under 180 characters." }, { status: 400 });
+      }
+      try {
+        const places = await geocode(query);
+        return Response.json({ places }, { headers: { "Cache-Control": "private, no-store" } });
+      } catch {
+        return Response.json({ error: "Place search is temporarily unavailable." }, { status: 502 });
+      }
+    }
+
     if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
 
     if (url.pathname === "/api/camera-index") {

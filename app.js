@@ -5,8 +5,9 @@ const map = L.map('map', { zoomControl: false, preferCanvas: true }).setView([39
 L.control.zoom({ position: 'bottomright' }).addTo(map);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
 
-const keyInput = document.querySelector('#api-key');
 const destinationInput = document.querySelector('#destination');
+const searchButton = document.querySelector('#search-destination');
+const placeResults = document.querySelector('#place-results');
 const routeButton = document.querySelector('#route-button');
 const cameraFile = document.querySelector('#camera-file');
 const cameraCount = document.querySelector('#camera-count');
@@ -21,35 +22,74 @@ const routeSummary = document.querySelector('#route-summary');
 const stepsList = document.querySelector('#steps');
 const mapCaption = document.querySelector('#map-caption');
 const clearButton = document.querySelector('#clear-button');
+const privacyChoiceButton = document.querySelector('#privacy-choice');
+const standardChoiceButton = document.querySelector('#standard-choice');
+const trailButton = document.querySelector('#trail-button');
+const trailStatus = document.querySelector('#trail-status');
+const trailDistanceOutput = document.querySelector('#trail-distance');
+const trailElapsedOutput = document.querySelector('#trail-elapsed');
+const clearTrailButton = document.querySelector('#clear-trail');
 
 let cameras = [];
 let importedCameras = [];
 let cameraIndexPromise = null;
 let cameraIndex = null;
+let selectedDestination = null;
+let pendingPlaces = [];
+let routeOptions = [];
+let selectedRouteId = null;
+let routeLayers = new Map();
+let routeStartMarker = null;
+let routeEndMarker = null;
 const tileCache = new Map();
 const cameraLayer = L.layerGroup().addTo(map);
 const cameraRenderer = L.canvas({ padding: 0.4 });
-let routeLayer = null;
-let originMarker = null;
-let destinationMarker = null;
+let trailWatchId = null;
+let trailTimerId = null;
+let trailStartedAt = null;
+let trailPoints = [];
+let trailDistance = 0;
+let latestFix = null;
+let trailLine = L.polyline([], { color: '#ee9654', weight: 4, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }).addTo(map);
+let trailMarker = null;
 const MAX_IMPORT_POINTS = 20000;
 const MAX_VISIBLE_MARKERS = 3500;
 const MAX_ROUTE_TILES = 300;
 const MAX_AREA_TILES = 100;
-const MAX_ROUTE_AVOID_PASSES = 4;
 const EARTH_RADIUS = 6371000;
 const CAMERA_ROUTE_ZOOM = 10;
+const FLOCKHOPPER_ROUTE_API = 'https://api.dontgetflocked.com/api/v1/route';
+const OSRM_ROUTE_API = 'https://router.project-osrm.org/route/v1/driving/';
 
-// MapQuest documents road-link avoidance, not camera avoidance. This bridge
-// identifies camera-adjacent links from each returned shape and retries them.
-document.querySelector('#key-form').addEventListener('submit', event => event.preventDefault());
 bufferInput.addEventListener('input', () => { bufferOutput.value = bufferInput.value + ' m'; });
 cameraToggle.addEventListener('change', renderCameraLayer);
 cameraFile.addEventListener('change', importCameraFile);
 routeButton.addEventListener('click', startRoute);
+searchButton.addEventListener('click', () => searchDestination(false));
 areaLoadButton.addEventListener('click', loadMapArea);
 clearButton.addEventListener('click', clearRoute);
-destinationInput.addEventListener('keydown', event => { if (event.key === 'Enter') startRoute(); });
+privacyChoiceButton.addEventListener('click', () => selectRoute('privacy'));
+standardChoiceButton.addEventListener('click', () => selectRoute('standard'));
+trailButton.addEventListener('click', toggleGpsTrail);
+clearTrailButton.addEventListener('click', clearGpsTrail);
+destinationInput.addEventListener('input', () => {
+  selectedDestination = null;
+  placeResults.hidden = true;
+});
+destinationInput.addEventListener('keydown', event => {
+  if (event.key === 'Enter') { event.preventDefault(); startRoute(); }
+  if (event.key === 'Escape') placeResults.hidden = true;
+});
+placeResults.addEventListener('click', event => {
+  const button = event.target.closest('[data-place-index]');
+  if (!button) return;
+  const place = pendingPlaces[Number(button.dataset.placeIndex)];
+  if (!place) return;
+  selectedDestination = place;
+  destinationInput.value = place.label;
+  placeResults.hidden = true;
+  setStatus('Destination selected: ' + place.label + '. Press route when ready.', 'success');
+});
 map.on('moveend zoomend', renderCameraLayer);
 
 function setStatus(message, kind = '') {
@@ -57,131 +97,267 @@ function setStatus(message, kind = '') {
   statusBox.className = 'status' + (kind ? ' ' + kind : '');
 }
 
-function readPosition() {
+function parseCoordinateInput(text) {
+  const match = text.trim().match(/^(-?[0-9]+(?:\.[0-9]+)?)\s*,\s*(-?[0-9]+(?:\.[0-9]+)?)$/);
+  if (!match) return null;
+  const lat = Number(match[1]), lng = Number(match[2]);
+  if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+  return { label: lat.toFixed(5) + ', ' + lng.toFixed(5), lat, lng };
+}
+
+async function geocodeQuery(query) {
+  let response;
+  try {
+    response = await fetch('/api/geocode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query }),
+    });
+  } catch {
+    throw new Error('Place search is unavailable. You can enter coordinates as latitude, longitude.');
+  }
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Place search failed.');
+  return data.places || [];
+}
+
+async function searchDestination(routeAfterSingle = false) {
+  const query = destinationInput.value.trim();
+  if (!query) return setStatus('Enter a destination or coordinates as latitude, longitude.', 'error');
+  const coordinates = parseCoordinateInput(query);
+  if (coordinates) {
+    selectedDestination = coordinates;
+    placeResults.hidden = true;
+    if (routeAfterSingle) return startRoute();
+    return setStatus('Coordinates selected. Press route when ready.', 'success');
+  }
+  searchButton.disabled = true;
+  searchButton.textContent = '…';
+  try {
+    pendingPlaces = await geocodeQuery(query);
+    if (!pendingPlaces.length) return setStatus('No places found. Try a fuller address or paste coordinates.', 'error');
+    if (pendingPlaces.length === 1) {
+      selectedDestination = pendingPlaces[0];
+      destinationInput.value = selectedDestination.label;
+      placeResults.hidden = true;
+      if (routeAfterSingle) return startRoute();
+      return setStatus('Destination selected: ' + selectedDestination.label + '.', 'success');
+    }
+    renderPlaceResults(pendingPlaces);
+    setStatus('Choose the matching destination from the results.', '');
+  } catch (error) {
+    setStatus(error.message || 'Place search failed.', 'error');
+  } finally {
+    searchButton.disabled = false;
+    searchButton.textContent = 'Find';
+  }
+}
+
+function renderPlaceResults(places) {
+  placeResults.replaceChildren();
+  places.forEach((place, index) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'place-result';
+    button.dataset.placeIndex = String(index);
+    button.setAttribute('role', 'option');
+    const label = document.createElement('strong'); label.textContent = place.label;
+    const detail = document.createElement('small'); detail.textContent = place.detail || 'OpenStreetMap place';
+    button.append(label, detail);
+    placeResults.append(button);
+  });
+  placeResults.hidden = false;
+}
+
+function getCurrentLocation() {
   return new Promise((resolve, reject) => {
-    if (!navigator.geolocation) return reject(new Error('This browser does not provide location access.'));
-    navigator.geolocation.getCurrentPosition(
-      position => resolve({ lat: position.coords.latitude, lng: position.coords.longitude }),
-      error => reject(new Error(error.code === 1 ? 'Location permission was declined. Allow location access, then try again.' : error.code === 2 ? 'Your location could not be determined. Try again from a place with a clearer GPS signal.' : 'Location took too long. Try again.')),
-      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
-    );
+    if (!navigator.geolocation) return reject(new Error('This browser does not support location access.'));
+    navigator.geolocation.getCurrentPosition(position => {
+      latestFix = { lat: position.coords.latitude, lng: position.coords.longitude, accuracy: position.coords.accuracy, timestamp: position.timestamp || Date.now() };
+      resolve({ lat: latestFix.lat, lng: latestFix.lng });
+    }, error => reject(new Error(error.code === 1 ? 'Location permission was declined. Allow location access, then try again.' : error.code === 2 ? 'Your location could not be determined. Try again in a clearer GPS area.' : 'Location took too long. Try again.')), { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 });
   });
 }
 
 async function startRoute() {
-  const key = keyInput.value.trim();
-  const destination = destinationInput.value.trim();
-  if (!key) return setStatus('Enter your MapQuest API key to request directions.', 'error');
-  if (!destination) return setStatus('Enter a destination first.', 'error');
-
+  if (routeButton.disabled) return;
   routeButton.disabled = true;
-  routeButton.querySelector('span:first-child').textContent = 'Finding your location…';
+  routeButton.querySelector('span:first-child').textContent = 'Preparing route…';
   resultBox.hidden = true;
-  setStatus('Waiting for location permission. Your browser will ask before sharing GPS.');
   try {
-    const origin = await readPosition();
-    mapCaption.textContent = 'Location acquired · calculating route';
-    setStatus('Requesting an initial MapQuest route…');
-    const initialRoute = await requestMapQuestRoute(key, origin, destination, []);
-    setStatus('Loading current camera tiles along the route and checking road links…');
-    const outcome = await calculateAvoidingRoute(key, origin, destination, Number(bufferInput.value), initialRoute);
-    renderRoute(outcome.route, origin, destination);
+    if (!selectedDestination) {
+      const direct = parseCoordinateInput(destinationInput.value);
+      if (direct) selectedDestination = direct;
+      else {
+        const places = await geocodeQuery(destinationInput.value.trim());
+        if (!places.length) throw new Error('No places found. Try a fuller address or paste coordinates.');
+        if (places.length > 1) {
+          pendingPlaces = places;
+          renderPlaceResults(places);
+          setStatus('Choose the matching destination from the results before routing.');
+          return;
+        }
+        selectedDestination = places[0];
+        destinationInput.value = selectedDestination.label;
+      }
+    }
+    setStatus('Requesting your location. Your browser asks before sharing GPS.');
+    const freshFix = latestFix && Date.now() - latestFix.timestamp < 30000;
+    const origin = freshFix ? { lat: latestFix.lat, lng: latestFix.lng } : await getCurrentLocation();
+    const straightDistance = haversineMeters([origin.lat, origin.lng], [selectedDestination.lat, selectedDestination.lng]);
+    let result;
+    let routeSource;
+    let fallbackNote = '';
+    if (isContiguousUS(origin) && isContiguousUS(selectedDestination) && straightDistance <= 300 * 1609.34) {
+      try {
+        setStatus('Requesting keyless camera-aware routes from DeFlock Maps…');
+        result = await requestDeFlockRoutes(origin, selectedDestination, Number(bufferInput.value));
+        routeSource = 'deflock';
+      } catch (error) {
+        fallbackNote = 'DeFlock privacy routing was unavailable (' + error.message + '); using keyless road routes instead.';
+      }
+    } else {
+      fallbackNote = 'Camera-aware route optimization is currently limited to US trips under 300 miles; using keyless road routes and comparing available alternatives.';
+    }
+    if (!result) {
+      setStatus('Requesting keyless OpenStreetMap routes…');
+      result = await requestOSRMRoutes(origin, selectedDestination);
+      routeSource = 'osrm';
+    }
 
-    const remaining = findNearbyCameras(outcome.route, Number(bufferInput.value));
-    const summaryParts = [];
-    if (outcome.initialNearby > 0) summaryParts.push(outcome.initialNearby + ' known camera point' + (outcome.initialNearby === 1 ? '' : 's') + ' near the first route');
-    if (outcome.linksRequested > 0) summaryParts.push('requested avoidance for ' + outcome.linksRequested + ' road link' + (outcome.linksRequested === 1 ? '' : 's'));
-    if (!outcome.cameraDataLoaded) summaryParts.push('no camera tiles were available');
-    if (remaining.length) summaryParts.push(remaining.length + ' known point' + (remaining.length === 1 ? '' : 's') + ' remain within ' + bufferInput.value + ' m');
-    else if (outcome.cameraDataLoaded) summaryParts.push('no loaded points remain within ' + bufferInput.value + ' m');
-    if (outcome.warning) summaryParts.push(outcome.warning);
-    if (outcome.updatedAt) summaryParts.push('camera tiles last updated ' + formatSourceDate(outcome.updatedAt));
-    summaryParts.push('inventory and avoidance are best-effort, not guaranteed');
-    setStatus(summaryParts.join('. ') + '.', remaining.length || outcome.warning ? 'warning' : 'success');
+    const index = await getCameraIndex();
+    const tileResults = await Promise.all(result.choices.map(choice => loadRouteCameraTiles(choice.route, Number(bufferInput.value)).catch(error => ({ warning: error.message, updatedAt: '' }))));
+    const tileWarning = tileResults.find(tile => tile.warning)?.warning || '';
+    const exposureDataAvailable = cameras.length > 0 || tileResults.some(tile => tile.tilesLoaded > 0);
+    result.choices.forEach(choice => {
+      if (!Number.isFinite(choice.cameraCount)) choice.cameraCount = exposureDataAvailable ? findNearbyCameras(choice.route, Number(bufferInput.value)).length : null;
+    });
+    routeOptions = arrangeRouteChoices(result.choices, routeSource);
+    selectedRouteId = 'privacy';
+    if (!routeOptions[0]) throw new Error('No route was returned.');
+    renderRouteChoices(origin, selectedDestination, routeSource);
     resultBox.hidden = false;
-    mapCaption.textContent = cameras.length.toLocaleString() + ' camera point' + (cameras.length === 1 ? '' : 's') + ' loaded · origin held in this tab';
-    renderCameraLayer();
+    const current = routeOptions.find(option => option.id === selectedRouteId) || routeOptions[0];
+    const detour = routeOptions[1] && routeDistance(routeOptions[1].route) > 0 ? Math.max(0, Math.round((routeDistance(current.route) / routeDistance(routeOptions[1].route) - 1) * 100)) : 0;
+    const parts = [];
+    if (routeSource === 'deflock') parts.push('Keyless DeFlock route comparison');
+    else parts.push(fallbackNote || 'Keyless road route comparison');
+    if (routeSource === 'deflock' && routeOptions[1]) parts.push('lower-camera option trades ' + detour + '% more distance for fewer mapped ALPRs');
+    if (tileWarning) parts.push(tileWarning);
+    const sourceUpdated = tileResults.find(tile => tile.updatedAt)?.updatedAt;
+    if (sourceUpdated) parts.push('camera tile feed updated ' + formatSourceDate(sourceUpdated));
+    parts.push('camera locations may be missing or outdated');
+    setStatus(parts.join('. ') + '.', tileWarning ? 'warning' : 'success');
+    mapCaption.textContent = cameras.length.toLocaleString() + ' camera points loaded · GPS not retained';
   } catch (error) {
-    setStatus(error.message || 'Could not calculate this route. Check the API key and connection.', 'error');
-    mapCaption.textContent = 'No location retained';
+    setStatus(error.message || 'Could not calculate routes. Try again.', 'error');
   } finally {
     routeButton.disabled = false;
-    routeButton.querySelector('span:first-child').textContent = 'Route from my location';
+    routeButton.querySelector('span:first-child').textContent = 'Plan route from my location';
   }
 }
 
-async function calculateAvoidingRoute(key, origin, destination, radius, initialRoute) {
-  let route = initialRoute;
-  let warning = '';
-  const blockedLinks = new Set();
-  let initialNearby = 0;
-  let initialCountSet = false;
-  let cameraDataLoaded = cameras.length > 0;
-  let updatedAt = '';
-
-  for (let pass = 0; pass < MAX_ROUTE_AVOID_PASSES; pass++) {
-    try {
-      const loaded = await loadRouteCameraTiles(route, radius);
-      cameraDataLoaded = cameraDataLoaded || loaded.tilesLoaded > 0;
-      updatedAt = loaded.updatedAt || updatedAt;
-      if (loaded.warning) warning = loaded.warning;
-    } catch (error) {
-      warning = error.message || 'Camera data could not be loaded';
-      initialNearby = findNearbyCameras(route, radius).length;
-      break;
-    }
-
-    const nearby = findNearbyCameras(route, radius);
-    if (!initialCountSet) { initialNearby = nearby.length; initialCountSet = true; }
-    const newLinks = new Set();
-    for (const camera of nearby) {
-      const links = linksNearCamera(route, camera, radius);
-      if (!links.length) continue;
-      for (const linkId of links) if (!blockedLinks.has(linkId)) newLinks.add(linkId);
-    }
-    if (!newLinks.size) break;
-    for (const linkId of newLinks) {
-      if (blockedLinks.size >= 100) break;
-      blockedLinks.add(linkId);
-    }
-    try {
-      route = await requestMapQuestRoute(key, origin, destination, Array.from(blockedLinks));
-    } catch {
-      warning = 'MapQuest could not find a route with all requested road links avoided; showing the last successful route';
-      break;
-    }
-    if (pass === MAX_ROUTE_AVOID_PASSES - 1) warning = 'Reached the reroute request limit';
-  }
-
-  return { route, warning, initialNearby, linksRequested: blockedLinks.size, cameraDataLoaded, updatedAt };
+function isContiguousUS(point) {
+  return point.lat >= 24 && point.lat <= 50.5 && point.lng >= -125 && point.lng <= -66;
 }
 
-async function requestMapQuestRoute(key, origin, destination, avoidIds) {
-  const params = new URLSearchParams({
-    key,
-    from: origin.lat + ',' + origin.lng,
-    to: destination,
-    routeType: 'fastest',
-    unit: 'k',
-    fullShape: 'true',
-    shapeFormat: 'raw',
-    maxLinkId: '10',
-    narrativeType: 'text',
-    outFormat: 'json'
-  });
-  if (avoidIds.length) params.set('mustAvoidLinkIds', avoidIds.join(','));
+async function requestDeFlockRoutes(origin, destination, clearance) {
   let response;
-  try { response = await fetch('https://www.mapquestapi.com/directions/v2/route?' + params.toString()); }
-  catch { throw new Error('Could not reach MapQuest. Check your connection and try again.'); }
-  let data;
-  try { data = await response.json(); }
-  catch { throw new Error('MapQuest returned an unreadable response.'); }
-  if (!response.ok) throw new Error('MapQuest request failed (' + response.status + ').');
-  if ((data.info && data.info.statuscode !== 0) || !data.route) {
-    const detail = data.info && data.info.messages && data.info.messages[0];
-    throw new Error((detail || 'No route was returned.') + ' Check your API key and destination.');
+  try {
+    response = await fetch(FLOCKHOPPER_ROUTE_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        origin: { lat: origin.lat, lon: origin.lng },
+        destination: { lat: destination.lat, lon: destination.lng },
+        format: 'full',
+        costing: 'auto',
+        cameraDistanceMeters: clearance,
+        useDirectionalZones: true,
+      }),
+    });
+  } catch {
+    throw new Error('service could not be reached');
   }
-  return data.route;
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data || !data.ok || !data.result) {
+    const message = data && data.error ? data.error : 'service did not return route options';
+    throw new Error(message);
+  }
+  const result = data.result;
+  const normal = result.normalRoute;
+  const avoidance = result.avoidanceRoute;
+  if (!normal?.route || !avoidance?.route) throw new Error('service returned incomplete route options');
+  return {
+    choices: [
+      { id: 'privacy', label: 'Fewer cameras', route: avoidance.route, cameraCount: (avoidance.camerasOnRoute || []).length, source: 'deflock' },
+      { id: 'standard', label: 'Standard route', route: normal.route, cameraCount: (normal.camerasOnRoute || []).length, source: 'deflock' },
+    ],
+  };
+}
+
+async function requestOSRMRoutes(origin, destination) {
+  const coords = origin.lng.toFixed(6) + ',' + origin.lat.toFixed(6) + ';' + destination.lng.toFixed(6) + ',' + destination.lat.toFixed(6);
+  const url = OSRM_ROUTE_API + coords + '?alternatives=1&steps=true&geometries=geojson&overview=full';
+  let response;
+  try { response = await fetch(url); }
+  catch { throw new Error('OpenStreetMap routing service could not be reached.'); }
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data || data.code !== 'Ok' || !Array.isArray(data.routes) || !data.routes.length) {
+    throw new Error(data?.message || data?.code || 'No road route was found.');
+  }
+  const choices = data.routes.slice(0, 2).map((route, index) => ({
+    id: 'osrm-' + index,
+    label: index === 0 ? 'Fastest route' : 'Alternative route',
+    route: {
+      geometry: route.geometry,
+      distanceMeters: route.distance,
+      durationSeconds: route.duration,
+      maneuvers: (route.legs || []).flatMap(leg => leg.steps || []).map(step => ({
+        instruction: describeOSRMStep(step),
+        length: step.distance,
+        time: step.duration,
+      })),
+    },
+    cameraCount: null,
+    source: 'osrm',
+  }));
+  return { choices };
+}
+
+function describeOSRMStep(step) {
+  const maneuver = step.maneuver || {};
+  const road = step.name || '';
+  if (maneuver.type === 'depart') return road ? 'Start on ' + road : 'Start route';
+  if (maneuver.type === 'arrive') return 'Arrive at destination';
+  const action = maneuver.type === 'turn' || maneuver.type === 'end of road' ? 'Turn' : capitalize(maneuver.type || 'Continue');
+  const direction = maneuver.modifier && maneuver.modifier !== 'straight' ? ' ' + maneuver.modifier : '';
+  return action + direction + (road ? ' onto ' + road : '');
+}
+
+function arrangeRouteChoices(choices, source) {
+  if (!choices.length) return [];
+  if (source === 'deflock') return choices.slice(0, 2);
+  if (choices.length === 1) return [{ ...choices[0], id: 'privacy', label: 'Keyless route' }];
+  const fastest = choices[0];
+  if (!choices.every(choice => Number.isFinite(choice.cameraCount))) {
+    return [
+      { ...fastest, id: 'privacy', label: 'Keyless road route' },
+      { ...choices[1], id: 'standard', label: 'Alternative route' },
+    ];
+  }
+  const lowerExposure = choices.reduce((best, item) => {
+    const itemCount = Number.isFinite(item.cameraCount) ? item.cameraCount : Infinity;
+    const bestCount = Number.isFinite(best.cameraCount) ? best.cameraCount : Infinity;
+    if (itemCount < bestCount) return item;
+    if (itemCount === bestCount && routeDistance(item.route) < routeDistance(best.route)) return item;
+    return best;
+  }, choices[0]);
+  const other = lowerExposure.id === fastest.id ? choices.find(choice => choice.id !== lowerExposure.id) : fastest;
+  return [
+    { ...lowerExposure, id: 'privacy', label: 'Fewer known cameras' },
+    { ...other, id: 'standard', label: other.label || 'Alternative route' },
+  ];
 }
 
 async function getCameraIndex() {
@@ -189,9 +365,7 @@ async function getCameraIndex() {
   if (!cameraIndexPromise) {
     cameraIndexPromise = fetch('/api/camera-index').then(async response => {
       const data = await response.json();
-      if (!response.ok || !data.countries || typeof data.countries !== 'object') {
-        throw new Error(data.error || 'Camera tile sources are unavailable.');
-      }
+      if (!response.ok || !data.countries || typeof data.countries !== 'object') throw new Error(data.error || 'Camera tile sources are unavailable.');
       cameraIndex = data;
       return cameraIndex;
     }).catch(error => { cameraIndexPromise = null; throw error; });
@@ -290,147 +464,98 @@ async function loadRouteCameraTiles(route, radius) {
   }
   const result = await loadCameraTiles(keys);
   if (result.errors) warning = warning || 'Some camera tiles could not be loaded; coverage is partial';
-  return {
-    tilesLoaded: result.loaded,
-    warning,
-    updatedAt: latestSourceUpdate(index, keys.map(key => key.split('/')[0])),
-  };
+  return { warning, tilesLoaded: result.loaded, updatedAt: latestSourceUpdate(index, keys.map(key => key.split('/')[0])) };
 }
 
 async function loadMapArea() {
-  if (map.getZoom() < 7) {
-    setStatus('Zoom in to a local area before loading its camera layer.', 'warning');
-    return;
-  }
+  if (map.getZoom() < 7) return setStatus('Zoom in to a local area before loading its camera layer.', 'warning');
   areaLoadButton.disabled = true;
   areaLoadButton.textContent = 'Loading camera tiles…';
   try {
     const index = await getCameraIndex();
     const zoom = Math.round(Math.max(9, Math.min(14, map.getZoom())));
-    let keys = visibleMapTileKeys(map.getBounds(), zoom, index);
+    const keys = visibleMapTileKeys(map.getBounds(), zoom, index);
     if (!keys.length) throw new Error('No camera tiles are indexed for this map area yet.');
     if (keys.length > MAX_AREA_TILES) throw new Error('Zoom in further to load a smaller map area.');
     const result = await loadCameraTiles(keys);
-    const updatedAt = latestSourceUpdate(index, keys.map(key => key.split('/')[0]));
-    const freshness = updatedAt ? ' Tile feed updated ' + formatSourceDate(updatedAt) + '.' : '';
-    setStatus(cameras.length.toLocaleString() + ' known camera points loaded from hourly community tiles.' + freshness + ' Inventory may be incomplete.', result.errors ? 'warning' : 'success');
-    mapCaption.textContent = cameras.length.toLocaleString() + ' camera point' + (cameras.length === 1 ? '' : 's') + ' loaded · DeFlock map / OSM';
+    setStatus(cameras.length.toLocaleString() + ' known camera points loaded. Community inventory may be incomplete.', result.errors ? 'warning' : 'success');
+    mapCaption.textContent = cameras.length.toLocaleString() + ' camera points · DeFlock Maps / OSM';
   } catch (error) { setStatus(error.message || 'Could not load camera data for this area.', 'error'); }
   finally { areaLoadButton.disabled = false; areaLoadButton.textContent = 'Load cameras for this map area'; }
 }
 
 async function loadCameraTiles(keys) {
   const missing = keys.filter(key => !tileCache.has(key));
-  let errors = 0, loaded = 0;
+  let errors = 0;
   for (let offset = 0; offset < missing.length; offset += 8) {
     const batch = missing.slice(offset, offset + 8);
-    const outcomes = await Promise.all(batch.map(async key => {
+    await Promise.all(batch.map(async key => {
       try {
         const [country, z, x, y] = key.split('/');
         const response = await fetch('/api/camera-tile?' + new URLSearchParams({ country, z, x, y }));
-        if (response.status === 204) { tileCache.set(key, []); loaded++; return; }
+        if (response.status === 204) { tileCache.set(key, []); return; }
         if (!response.ok) throw new Error('Tile request failed');
         const buffer = await response.arrayBuffer();
-        const decoded = buffer.byteLength ? decodeCameraTile(buffer, Number(z), Number(x), Number(y)) : [];
-        tileCache.set(key, decoded);
-        loaded++;
+        tileCache.set(key, buffer.byteLength ? decodeCameraTile(buffer, Number(z), Number(x), Number(y)) : []);
       } catch { errors++; }
     }));
   }
   refreshCameraList();
-  return { errors, loaded };
+  return { errors, loaded: keys.length - errors };
 }
 
 function decodeCameraTile(buffer, z, x, y) {
   const tile = new VectorTile(new PbfReader(new Uint8Array(buffer)));
   const layer = tile.layers.cameras;
   if (!layer) return [];
-  const decoded = [];
+  const points = [];
   for (let i = 0; i < layer.length; i++) {
     const feature = layer.feature(i);
     const geo = feature.toGeoJSON(x, y, z);
     const geometry = geo.geometry;
     if (!geometry) continue;
-    const coordinates = geometry.type === 'Point' ? [geometry.coordinates] : geometry.type === 'MultiPoint' ? geometry.coordinates : [];
-    const properties = geo.properties || feature.properties || {};
-    for (const coordinate of coordinates) {
+    const coords = geometry.type === 'Point' ? [geometry.coordinates] : geometry.type === 'MultiPoint' ? geometry.coordinates : [];
+    const p = geo.properties || feature.properties || {};
+    for (const coordinate of coords) {
       const lng = Number(coordinate[0]), lat = Number(coordinate[1]);
       if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
-      const osmId = properties.osmId ?? feature.id ?? (lat.toFixed(6) + ',' + lng.toFixed(6));
-      const tags = {
-        operator: properties.operator,
-        brand: properties.brand,
-        direction: properties.direction,
-        directions: properties.directions,
-        surveillanceZone: properties.surveillanceZone,
-        mountType: properties.mountType,
-      };
-      decoded.push({
-        id: 'osm-' + String(osmId), lat, lng,
-        name: properties.brand || properties.operator || 'Crowdsourced ALPR location',
-        tags, source: 'DeFlock map / OpenStreetMap'
-      });
+      const tags = { operator: p.operator, brand: p.brand, direction: p.direction, directions: p.directions, surveillanceZone: p.surveillanceZone, mountType: p.mountType };
+      points.push({ id: 'osm-' + String(p.osmId ?? feature.id ?? lat + ',' + lng), lat, lng, name: p.brand || p.operator || 'ALPR location', tags, source: 'DeFlock Maps / OpenStreetMap' });
     }
   }
-  return decoded;
+  return points;
 }
 
 function latestSourceUpdate(index, countries) {
   const dates = countries.map(country => index.countries[country]?.updatedAt).filter(Boolean);
-  if (!dates.length) return '';
-  return dates.sort((a, b) => new Date(b) - new Date(a))[0];
-}
-
-function formatSourceDate(value) {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(date);
+  return dates.sort((a, b) => new Date(b) - new Date(a))[0] || '';
 }
 
 function refreshCameraList() {
-  const all = importedCameras.slice();
-  for (const tile of tileCache.values()) all.push(...tile);
-  const unique = new Map();
-  for (const camera of all) {
-    if (!Number.isFinite(camera.lat) || !Number.isFinite(camera.lng)) continue;
-    const key = camera.id || camera.lat.toFixed(6) + ',' + camera.lng.toFixed(6);
-    if (!unique.has(key)) unique.set(key, camera);
-  }
+  const unique = new Map(importedCameras.map(camera => [camera.id, camera]));
+  for (const tile of tileCache.values()) for (const camera of tile) if (!unique.has(camera.id)) unique.set(camera.id, camera);
   cameras = Array.from(unique.values());
   cameraCount.textContent = cameras.length.toLocaleString() + ' loaded';
   renderCameraLayer();
 }
 
-function linksNearCamera(route, camera, radius) {
-  const points = getShape(route);
-  if (points.length < 2) return [];
-  let closestDistance = Infinity, closestSegment = -1;
-  for (let i = 0; i < points.length - 1; i++) {
-    const distance = pointToSegmentMeters(camera, points[i], points[i + 1]);
-    if (distance < closestDistance) { closestDistance = distance; closestSegment = i; }
+function renderCameraLayer() {
+  cameraLayer.clearLayers();
+  if (!cameraToggle.checked || !cameras.length) return;
+  const bounds = map.getBounds().pad(0.02);
+  let visible = cameras.filter(camera => bounds.contains([camera.lat, camera.lng]));
+  if (visible.length > MAX_VISIBLE_MARKERS) {
+    const center = map.getCenter();
+    visible = visible.sort((a, b) => distanceSquared(a, center) - distanceSquared(b, center)).slice(0, MAX_VISIBLE_MARKERS);
+    mapCaption.textContent = 'Showing ' + MAX_VISIBLE_MARKERS.toLocaleString() + ' of ' + cameras.length.toLocaleString() + ' camera points';
   }
-  if (closestDistance > radius || closestSegment < 0) return [];
-  const starts = (route.shape && route.shape.maneuverIndexes) || route.maneuverIndexes || [];
-  let maneuverIndex = -1;
-  for (let i = 0; i < starts.length; i++) if (starts[i] <= closestSegment) maneuverIndex = i;
-  const maneuver = (route.legs || []).flatMap(leg => leg.maneuvers || [])[maneuverIndex];
-  return (maneuver && maneuver.linkIds || []).map(String).filter(id => /^\d+$/.test(id));
-}
-
-function getShape(route) {
-  const raw = (route.shape && route.shape.shapePoints) || route.shapePoints || [];
-  const points = [];
-  if (Array.isArray(raw) && raw.length && typeof raw[0] === 'object') {
-    for (const point of raw) {
-      const lat = Number(point.lat ?? point.latitude), lng = Number(point.lng ?? point.lon ?? point.longitude);
-      if (Number.isFinite(lat) && Number.isFinite(lng)) points.push([lat, lng]);
-    }
-  } else {
-    for (let i = 0; i + 1 < raw.length; i += 2) {
-      const lat = Number(raw[i]), lng = Number(raw[i + 1]);
-      if (Number.isFinite(lat) && Number.isFinite(lng)) points.push([lat, lng]);
-    }
+  for (const camera of visible) {
+    const marker = L.circleMarker([camera.lat, camera.lng], { renderer: cameraRenderer, radius: 6, color: '#fff', weight: 1.5, fillColor: '#e9655b', fillOpacity: 0.95 });
+    const popup = document.createElement('div'); popup.className = 'camera-popup';
+    const title = document.createElement('strong'); title.textContent = camera.name || 'ALPR location';
+    const detail = document.createElement('span'); detail.textContent = ((camera.tags && camera.tags.operator) ? 'Operator: ' + camera.tags.operator + ' · ' : '') + (camera.source || 'DeFlock Maps / OpenStreetMap') + ' · ' + camera.lat.toFixed(5) + ', ' + camera.lng.toFixed(5);
+    popup.append(title, detail); marker.bindPopup(popup); marker.addTo(cameraLayer);
   }
-  return points;
 }
 
 function findNearbyCameras(route, radius) {
@@ -449,6 +574,19 @@ function findNearbyCameras(route, radius) {
   });
 }
 
+function getShape(route) {
+  const geometry = route.geometry;
+  if (geometry && Array.isArray(geometry.coordinates)) return geometry.coordinates.map(point => [Number(point[1]), Number(point[0])]).filter(point => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+  if (Array.isArray(geometry)) return geometry.map(point => [Number(point[0]), Number(point[1])]).filter(point => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+  const raw = (route.shape && route.shape.shapePoints) || route.shapePoints || [];
+  const points = [];
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    const lat = Number(raw[i]), lng = Number(raw[i + 1]);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) points.push([lat, lng]);
+  }
+  return points;
+}
+
 function pointToSegmentMeters(point, start, end) {
   const cos = Math.cos(point.lat * Math.PI / 180);
   const project = value => ({ x: (value[1] - point.lng) * Math.PI / 180 * EARTH_RADIUS * cos, y: (value[0] - point.lat) * Math.PI / 180 * EARTH_RADIUS });
@@ -464,11 +602,176 @@ function haversineMeters(start, end) {
   return 2 * EARTH_RADIUS * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-async function importCameraFile(event) {
+function routeDistance(route) { return Number(route.distanceMeters ?? route.distance ?? 0); }
+function routeDuration(route) { return Number(route.durationSeconds ?? route.duration ?? 0); }
+function distanceSquared(point, center) { return (point.lat - center.lat) ** 2 + (point.lng - center.lng) ** 2; }
+function capitalize(value) { return value ? value[0].toUpperCase() + value.slice(1) : ''; }
+function formatMeters(meters) { return meters >= 1000 ? (meters / 1000).toFixed(meters >= 10000 ? 0 : 1) + ' km' : Math.round(meters) + ' m'; }
+function formatDuration(seconds) {
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return minutes + ' min';
+  const hours = Math.floor(minutes / 60), remainder = minutes % 60;
+  return remainder ? hours + ' hr ' + remainder + ' min' : hours + ' hr';
+}
+function formatSourceDate(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(date);
+}
+
+function renderRouteChoices(origin, destination, source) {
+  for (const line of routeLayers.values()) map.removeLayer(line);
+  routeLayers.clear();
+  if (routeStartMarker) map.removeLayer(routeStartMarker);
+  if (routeEndMarker) map.removeLayer(routeEndMarker);
+  const privacy = routeOptions[0];
+  const standard = routeOptions[1] || null;
+  const privacyLabel = document.querySelector('#privacy-choice-label');
+  const standardLabel = document.querySelector('#standard-choice-label');
+  privacyChoiceButton.hidden = !privacy;
+  standardChoiceButton.hidden = !standard;
+  privacyLabel.textContent = privacy ? privacy.label : '';
+  standardLabel.textContent = standard ? standard.label : '';
+  fillRouteChoiceCard(privacyChoiceButton, privacy, standard);
+  fillRouteChoiceCard(standardChoiceButton, standard, standard);
+  routeStartMarker = L.circleMarker([origin.lat, origin.lng], { radius: 7, color: '#fff', weight: 3, fillColor: '#68882c', fillOpacity: 1 }).addTo(map).bindTooltip('Route start', { direction: 'top', offset: [0, -8] });
+  routeEndMarker = L.circleMarker([destination.lat, destination.lng], { radius: 7, color: '#fff', weight: 3, fillColor: '#e06759', fillOpacity: 1 }).addTo(map).bindTooltip(destination.label, { direction: 'top', offset: [0, -8] });
+  for (const choice of routeOptions) {
+    const selected = choice.id === selectedRouteId;
+    const line = L.polyline(getShape(choice.route), { color: selected ? '#537cde' : '#8d9690', weight: selected ? 5 : 3, opacity: selected ? 0.95 : 0.65, dashArray: selected ? null : '5 7', lineCap: 'round', lineJoin: 'round' }).addTo(map);
+    routeLayers.set(choice.id, line);
+  }
+  updateSelectedRoute();
+  const selected = routeOptions.find(choice => choice.id === selectedRouteId) || privacy;
+  const shape = getShape(selected.route);
+  if (shape.length) map.fitBounds(L.latLngBounds(shape).pad(0.13), { maxZoom: 15 });
+  cameraLayer.bringToFront();
+  trailLine.bringToFront();
+  if (trailMarker) trailMarker.bringToFront();
+  mapCaption.textContent = cameras.length.toLocaleString() + ' camera points loaded · origin not retained';
+}
+
+function fillRouteChoiceCard(button, choice, standard) {
+  if (!choice) return;
+  const distance = routeDistance(choice.route);
+  const duration = routeDuration(choice.route);
+  const cameraCountValue = Number.isFinite(choice.cameraCount) ? choice.cameraCount : 0;
+  const baseline = standard ? routeDistance(standard.route) : distance;
+  const delta = baseline > 0 ? Math.round((distance / baseline - 1) * 100) : 0;
+  button.querySelector('strong').textContent = formatMeters(distance) + ' · ' + formatDuration(duration);
+  let exposure = Number.isFinite(choice.cameraCount) ? cameraCountValue + ' known ALPR' + (cameraCountValue === 1 ? '' : 's') : 'Exposure unavailable';
+  if (delta > 0 && choice.id === 'privacy') exposure += ' · +' + delta + '% distance';
+  button.querySelector('small').textContent = exposure;
+}
+
+function selectRoute(id) {
+  if (!routeOptions.some(choice => choice.id === id)) return;
+  selectedRouteId = id;
+  updateSelectedRoute();
+}
+
+function updateSelectedRoute() {
+  for (const choice of routeOptions) {
+    const selected = choice.id === selectedRouteId;
+    const line = routeLayers.get(choice.id);
+    if (line) line.setStyle({ color: selected ? '#537cde' : '#8d9690', weight: selected ? 5 : 3, opacity: selected ? 0.95 : 0.65, dashArray: selected ? null : '5 7' });
+  }
+  privacyChoiceButton.classList.toggle('active', selectedRouteId === (routeOptions[0] && routeOptions[0].id));
+  standardChoiceButton.classList.toggle('active', selectedRouteId === (routeOptions[1] && routeOptions[1].id));
+  const choice = routeOptions.find(item => item.id === selectedRouteId);
+  if (!choice) return;
+  routeSummary.textContent = choice.label + ' · ' + formatMeters(routeDistance(choice.route)) + ' · ' + formatDuration(routeDuration(choice.route));
+  renderManeuvers(choice.route);
+}
+
+function renderManeuvers(route) {
+  stepsList.replaceChildren();
+  let maneuvers = route.maneuvers || [];
+  if (!maneuvers.length && route.legs) maneuvers = route.legs.flatMap(leg => (leg.steps || []).map(step => ({ instruction: describeOSRMStep(step), length: step.distance, time: step.duration })));
+  maneuvers.forEach((maneuver, index) => {
+    const li = document.createElement('li'), number = document.createElement('span'), narrative = document.createElement('span'), distance = document.createElement('span');
+    number.className = 'step-num'; number.textContent = String(index + 1).padStart(2, '0');
+    narrative.textContent = maneuver.instruction || maneuver.narrative || 'Continue along route';
+    distance.className = 'step-distance';
+    const meters = Number(maneuver.length ?? maneuver.distance ?? 0);
+    distance.textContent = meters ? formatMeters(meters) : '';
+    li.append(number, narrative, distance); stepsList.append(li);
+  });
+}
+
+function toggleGpsTrail() {
+  if (trailWatchId !== null) return stopGpsTrail();
+  if (!navigator.geolocation) { trailStatus.textContent = 'This browser does not support GPS tracking.'; return; }
+  trailStartedAt = Date.now();
+  trailWatchId = navigator.geolocation.watchPosition(onTrailPosition, onTrailError, { enableHighAccuracy: true, maximumAge: 2000, timeout: 20000 });
+  trailButton.textContent = 'Stop GPS trail';
+  trailButton.classList.add('active');
+  trailStatus.textContent = 'Waiting for an accurate GPS fix. Trail is stored only in this tab.';
+  trailTimerId = setInterval(updateTrailStats, 1000);
+  updateTrailStats();
+}
+
+function onTrailPosition(position) {
+  const point = { lat: position.coords.latitude, lng: position.coords.longitude, accuracy: position.coords.accuracy, timestamp: position.timestamp || Date.now() };
+  latestFix = point;
+  if (point.accuracy > 100) {
+    trailStatus.textContent = 'GPS accuracy is about ' + Math.round(point.accuracy) + ' m; waiting for a clearer fix.';
+    return;
+  }
+  const last = trailPoints[trailPoints.length - 1];
+  if (last) {
+    const moved = haversineMeters([last.lat, last.lng], [point.lat, point.lng]);
+    const elapsed = (point.timestamp - last.timestamp) / 1000;
+    if (moved < 5 || (elapsed < 2 && moved > 100)) return;
+    trailDistance += moved;
+  } else {
+    map.setView([point.lat, point.lng], Math.max(14, map.getZoom()));
+  }
+  trailPoints.push(point);
+  if (trailPoints.length > 10000) trailPoints.shift();
+  trailLine.setLatLngs(trailPoints.map(item => [item.lat, item.lng]));
+  if (!trailMarker) trailMarker = L.circleMarker([point.lat, point.lng], { radius: 8, color: '#fff', weight: 3, fillColor: '#ee9654', fillOpacity: 1 }).addTo(map);
+  else trailMarker.setLatLng([point.lat, point.lng]);
+  trailLine.bringToFront(); trailMarker.bringToFront();
+  trailStatus.textContent = 'Recording · ' + trailPoints.length.toLocaleString() + ' points · accuracy ' + Math.round(point.accuracy) + ' m. Not uploaded.';
+  updateTrailStats();
+}
+
+function onTrailError(error) {
+  trailStatus.textContent = error.code === 1 ? 'GPS permission was declined.' : 'GPS signal was lost; trail is paused until a fix returns.';
+  if (error.code === 1) stopGpsTrail();
+}
+
+function stopGpsTrail() {
+  if (trailWatchId !== null) navigator.geolocation.clearWatch(trailWatchId);
+  trailWatchId = null;
+  if (trailTimerId !== null) clearInterval(trailTimerId);
+  trailTimerId = null;
+  trailButton.textContent = 'Resume GPS trail';
+  trailButton.classList.remove('active');
+  if (trailPoints.length) trailStatus.textContent = 'Trail paused · stored only in this tab. Clear it to remove the recorded line.';
+}
+
+function clearGpsTrail() {
+  if (trailWatchId !== null) stopGpsTrail();
+  trailPoints = []; trailDistance = 0; trailStartedAt = null;
+  trailLine.setLatLngs([]);
+  if (trailMarker) { map.removeLayer(trailMarker); trailMarker = null; }
+  trailButton.textContent = 'Start GPS trail';
+  trailStatus.textContent = 'Trail cleared. New points stay in this tab only.';
+  updateTrailStats();
+}
+
+function updateTrailStats() {
+  trailDistanceOutput.textContent = formatMeters(trailDistance);
+  const seconds = trailStartedAt ? Math.floor((Date.now() - trailStartedAt) / 1000) : 0;
+  const minutes = Math.floor(seconds / 60);
+  trailElapsedOutput.textContent = String(minutes).padStart(2, '0') + ':' + String(seconds % 60).padStart(2, '0');
+}
+
+function importCameraFile(event) {
   const file = event.target.files && event.target.files[0];
   if (!file) return;
-  try {
-    const text = await file.text();
+  file.text().then(text => {
     const imported = file.name.toLowerCase().endsWith('.csv') ? parseCsv(text) : parseGeoJson(JSON.parse(text));
     if (!imported.length) throw new Error('No valid coordinate points were found.');
     if (imported.length > MAX_IMPORT_POINTS) throw new Error('This file has more than ' + MAX_IMPORT_POINTS.toLocaleString() + ' points.');
@@ -476,114 +779,61 @@ async function importCameraFile(event) {
     uploadLabel.textContent = file.name;
     refreshCameraList();
     setStatus(imported.length.toLocaleString() + ' points from ' + file.name + ' loaded locally; the file was not uploaded.', 'success');
-  } catch (error) { setStatus(error.message || 'Could not read that camera-location file.', 'error'); }
-  finally { cameraFile.value = ''; }
+  }).catch(error => setStatus(error.message || 'Could not read that camera-location file.', 'error')).finally(() => { cameraFile.value = ''; });
 }
 
 function parseGeoJson(data) {
   const found = [];
-  const addFeature = feature => {
+  const add = feature => {
     if (!feature || !feature.geometry) return;
     const properties = feature.properties || {};
-    const name = properties.name || properties.title || properties.operator || properties.type || 'Known camera location';
-    const addPoint = coordinates => {
-      const lng = Number(coordinates && coordinates[0]), lat = Number(coordinates && coordinates[1]);
-      if (Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) found.push({ lat, lng, name, id: properties.id });
-    };
-    if (feature.geometry.type === 'Point') addPoint(feature.geometry.coordinates);
-    if (feature.geometry.type === 'MultiPoint') feature.geometry.coordinates.forEach(addPoint);
+    const coords = feature.geometry.type === 'Point' ? [feature.geometry.coordinates] : feature.geometry.type === 'MultiPoint' ? feature.geometry.coordinates : [];
+    for (const coordinate of coords) {
+      const lng = Number(coordinate && coordinate[0]), lat = Number(coordinate && coordinate[1]);
+      if (Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) found.push({ lat, lng, name: properties.name || properties.brand || properties.operator || 'Known ALPR', id: properties.id, tags: properties, source: 'Imported data' });
+    }
   };
-  if (data.type === 'FeatureCollection') (data.features || []).forEach(addFeature);
-  else if (data.type === 'Feature') addFeature(data);
-  else if (data.type === 'Point') addFeature({ geometry: data, properties: {} });
-  else throw new Error('GeoJSON must be a Point, MultiPoint, Feature, or FeatureCollection.');
+  if (data.type === 'FeatureCollection') (data.features || []).forEach(add);
+  else if (data.type === 'Feature') add(data);
+  else if (data.type === 'Point') add({ geometry: data, properties: {} });
+  else throw new Error('GeoJSON must contain Point or MultiPoint features.');
   return found;
 }
 
 function parseCsv(text) {
   const rows = text.replace(/^\uFEFF/, '').split(/\r?\n/).filter(line => line.trim());
-  if (rows.length < 2) throw new Error('CSV needs a header row and at least one location.');
-  const splitRow = line => {
-    const cells = []; let cell = '', quoted = false;
+  if (rows.length < 2) throw new Error('CSV needs headers and at least one location.');
+  const split = line => {
+    const cells = []; let cell = '', quote = false;
     for (let i = 0; i < line.length; i++) {
       const char = line[i];
-      if (char === '"' && line[i + 1] === '"' && quoted) { cell += '"'; i++; }
-      else if (char === '"') quoted = !quoted;
-      else if (char === ',' && !quoted) { cells.push(cell.trim()); cell = ''; }
+      if (char === '"' && line[i + 1] === '"' && quote) { cell += '"'; i++; }
+      else if (char === '"') quote = !quote;
+      else if (char === ',' && !quote) { cells.push(cell.trim()); cell = ''; }
       else cell += char;
     }
     cells.push(cell.trim()); return cells;
   };
-  const headers = splitRow(rows[0]).map(value => value.toLowerCase().replace(/[ _-]/g, ''));
+  const headers = split(rows[0]).map(value => value.toLowerCase().replace(/[ _-]/g, ''));
   const latIndex = headers.findIndex(value => ['lat', 'latitude', 'y'].includes(value));
   const lngIndex = headers.findIndex(value => ['lng', 'lon', 'long', 'longitude', 'x'].includes(value));
   if (latIndex < 0 || lngIndex < 0) throw new Error('CSV needs latitude and longitude columns.');
-  const nameIndex = headers.findIndex(value => ['name', 'title', 'operator', 'type', 'location'].includes(value));
-  return rows.slice(1).map(line => {
-    const cells = splitRow(line), lat = Number(cells[latIndex]), lng = Number(cells[lngIndex]);
-    return { lat, lng, name: nameIndex >= 0 && cells[nameIndex] ? cells[nameIndex] : 'Known camera location' };
+  const nameIndex = headers.findIndex(value => ['name', 'title', 'brand', 'operator'].includes(value));
+  return rows.slice(1).map((line, index) => {
+    const cells = split(line), lat = Number(cells[latIndex]), lng = Number(cells[lngIndex]);
+    return { lat, lng, id: index, name: nameIndex >= 0 ? cells[nameIndex] : 'Known ALPR', source: 'Imported data' };
   }).filter(point => Number.isFinite(point.lat) && Number.isFinite(point.lng) && Math.abs(point.lat) <= 90 && Math.abs(point.lng) <= 180);
 }
 
-function renderCameraLayer() {
-  cameraLayer.clearLayers();
-  if (!cameraToggle.checked || !cameras.length) return;
-  const bounds = map.getBounds().pad(0.02);
-  let visible = cameras.filter(camera => bounds.contains([camera.lat, camera.lng]));
-  if (visible.length > MAX_VISIBLE_MARKERS) {
-    const center = map.getCenter();
-    visible = visible.sort((a, b) => distanceSquared(a, center) - distanceSquared(b, center)).slice(0, MAX_VISIBLE_MARKERS);
-    mapCaption.textContent = 'Showing ' + MAX_VISIBLE_MARKERS.toLocaleString() + ' nearest of ' + cameras.length.toLocaleString() + ' loaded camera points';
-  }
-  for (const camera of visible) {
-    const marker = L.circleMarker([camera.lat, camera.lng], { renderer: cameraRenderer, radius: 6, color: '#fff', weight: 1.5, fillColor: '#e9655b', fillOpacity: 0.95 });
-    const popup = document.createElement('div'); popup.className = 'camera-popup';
-    const title = document.createElement('strong'); title.textContent = camera.name || 'Known camera location';
-    const source = document.createElement('span'); source.textContent = ((camera.tags && camera.tags.operator) ? 'Operator: ' + camera.tags.operator + ' · ' : '') + (camera.source || 'DeFlock map / OpenStreetMap') + ' · ' + camera.lat.toFixed(5) + ', ' + camera.lng.toFixed(5);
-    popup.append(title, source); marker.bindPopup(popup); marker.addTo(cameraLayer);
-  }
-}
-
-function distanceSquared(point, center) { return (point.lat - center.lat) ** 2 + (point.lng - center.lng) ** 2; }
-
-function renderRoute(route, origin, destinationText) {
-  const points = getShape(route);
-  if (!points.length) throw new Error('MapQuest returned directions without route geometry.');
-  if (routeLayer) map.removeLayer(routeLayer);
-  if (originMarker) map.removeLayer(originMarker);
-  if (destinationMarker) map.removeLayer(destinationMarker);
-  routeLayer = L.polyline(points, { color: '#537cde', weight: 5, opacity: 0.9, lineCap: 'round', lineJoin: 'round' }).addTo(map);
-  originMarker = L.circleMarker([origin.lat, origin.lng], { radius: 7, color: '#fff', weight: 3, fillColor: '#68882c', fillOpacity: 1 }).addTo(map).bindTooltip('Your location', { direction: 'top', offset: [0, -8] });
-  const destinationPoint = route.locations && route.locations.length && route.locations[route.locations.length - 1].latLng;
-  if (destinationPoint && Number.isFinite(destinationPoint.lat) && Number.isFinite(destinationPoint.lng)) {
-    destinationMarker = L.circleMarker([destinationPoint.lat, destinationPoint.lng], { radius: 7, color: '#fff', weight: 3, fillColor: '#e06759', fillOpacity: 1 }).addTo(map).bindTooltip(destinationText, { direction: 'top', offset: [0, -8] });
-  }
-  map.fitBounds(routeLayer.getBounds().pad(0.13), { maxZoom: 15 });
-  const km = Number(route.distance || 0), minutes = Math.round(Number(route.time || 0) / 60);
-  routeSummary.textContent = (km < 10 ? km.toFixed(1) : Math.round(km)) + ' km · ' + formatDuration(minutes);
-  stepsList.replaceChildren();
-  (route.legs || []).flatMap(leg => leg.maneuvers || []).forEach((maneuver, index) => {
-    const li = document.createElement('li'), number = document.createElement('span'), narrative = document.createElement('span'), distance = document.createElement('span');
-    number.className = 'step-num'; number.textContent = String(index + 1).padStart(2, '0');
-    narrative.textContent = maneuver.narrative || 'Continue along route';
-    distance.className = 'step-distance'; distance.textContent = maneuver.distance ? Number(maneuver.distance).toFixed(1) + ' km' : '';
-    li.append(number, narrative, distance); stepsList.append(li);
-  });
-}
-
-function formatDuration(minutes) {
-  if (minutes < 60) return minutes + ' min';
-  const hours = Math.floor(minutes / 60), remainder = minutes % 60;
-  return remainder ? hours + ' hr ' + remainder + ' min' : hours + ' hr';
-}
-
 function clearRoute() {
-  if (routeLayer) map.removeLayer(routeLayer);
-  if (originMarker) map.removeLayer(originMarker);
-  if (destinationMarker) map.removeLayer(destinationMarker);
-  routeLayer = originMarker = destinationMarker = null;
+  for (const line of routeLayers.values()) map.removeLayer(line);
+  routeLayers.clear();
+  if (routeStartMarker) map.removeLayer(routeStartMarker);
+  if (routeEndMarker) map.removeLayer(routeEndMarker);
+  routeStartMarker = routeEndMarker = null;
+  routeOptions = [];
+  selectedRouteId = null;
   resultBox.hidden = true;
   mapCaption.textContent = cameras.length ? cameras.length.toLocaleString() + ' camera points loaded' : 'Open map · no camera tiles loaded';
-  if (cameras.length) renderCameraLayer();
-  setStatus('Route cleared. Your location is not retained.');
+  setStatus('Route options cleared.');
 }
